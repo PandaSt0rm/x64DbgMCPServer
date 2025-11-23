@@ -91,7 +91,15 @@ namespace DotNetPlugin
         public static void cbStartMCPServer(string[] args)
         {
             Console.WriteLine("Starting MCPServer");
-            GSimpleMcpServer = new SimpleMcpServer(typeof(DotNetPlugin.Plugin));
+            if (GSimpleMcpServer != null && GSimpleMcpServer.IsRunning)
+            {
+                Console.WriteLine("MCP server already running; stop it first if you need to restart.");
+                return;
+            }
+
+            if (GSimpleMcpServer == null)
+                GSimpleMcpServer = new SimpleMcpServer(typeof(DotNetPlugin.Plugin));
+
             GSimpleMcpServer.Start();
             Console.WriteLine("MCPServer Started");
         }
@@ -100,8 +108,15 @@ namespace DotNetPlugin
         public static void cbStopMCPServer(string[] args)
         {
             Console.WriteLine("Stopping MCPServer");
-            GSimpleMcpServer.Stop();
-            GSimpleMcpServer = null;
+            if (GSimpleMcpServer == null)
+            {
+                Console.WriteLine("MCP server was not started.");
+            }
+            else
+            {
+                GSimpleMcpServer.Stop();
+                GSimpleMcpServer = null;
+            }
             Console.WriteLine("MCPServer Stopped");
         }
 

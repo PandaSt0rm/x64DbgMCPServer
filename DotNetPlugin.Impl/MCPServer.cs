@@ -19,6 +19,7 @@ namespace DotNetPlugin
         private readonly HttpListener _listener = new HttpListener();
         private readonly Dictionary<string, MethodInfo> _commands = new Dictionary<string, MethodInfo>(StringComparer.OrdinalIgnoreCase);
         private readonly Type _targetType;
+        public bool IsRunning => _isRunning;
 
         public bool IsActivelyDebugging
         {
@@ -31,9 +32,10 @@ namespace DotNetPlugin
             //DisableServerHeader(); //Prob not needed
             _targetType = commandSourceType;
             string IPAddress = "+";
-            Console.WriteLine("MCP server lising on " + IPAddress);
             _listener.Prefixes.Add("http://" + IPAddress + ":50300/sse/"); //Request come in without a trailing '/' but are still handled
             _listener.Prefixes.Add("http://" + IPAddress + ":50300/message/");
+            var prefixes = string.Join(", ", _listener.Prefixes.Cast<string>());
+            Console.WriteLine("MCP server lising on " + prefixes);
 
             //_listener.Prefixes.Add("http://127.0.0.1:50300/sse/"); //Request come in without a trailing '/' but are still handled
             //_listener.Prefixes.Add("http://127.0.0.1:50300/message/");
@@ -128,6 +130,15 @@ namespace DotNetPlugin
                 _isRunning = true;
                 Console.WriteLine("MCP server started. CurrentlyDebugging: " + Bridge.DbgIsDebugging() + " IsRunning: " + Bridge.DbgIsRunning());
             }
+            catch (HttpListenerException hlex) when (hlex.ErrorCode == 5 || hlex.NativeErrorCode == 5)
+            {
+                // Http.sys blocks the URL when no URLACL exists for the current user.
+                Console.WriteLine("Failed to start MCP server: Access is denied (HTTP.sys URL ACL missing).");
+                Console.WriteLine("Fix (run once from elevated PowerShell/CMD):");
+                Console.WriteLine("  netsh http add urlacl url=http://+:50300/sse/ user=Everyone");
+                Console.WriteLine("  netsh http add urlacl url=http://+:50300/message/ user=Everyone");
+                Console.WriteLine("Or start x64dbg with Run as administrator, then try again.");
+            }
             catch (Exception ex)
             {
                 Console.WriteLine("Failed to start MCP server: " + ex.Message);
@@ -191,8 +202,9 @@ namespace DotNetPlugin
         }
     }
 
-        static bool pDebug = false;
+        static bool pDebug = true;
     private static readonly Dictionary<string, StreamWriter> _sseSessions = new Dictionary<string, StreamWriter>();
+    private static readonly Dictionary<string, string> _addrToSession = new Dictionary<string, string>(); // maps remote IP to sessionId
 
         private async void OnRequest(IAsyncResult ar) // Make async void for simplicity here, consider Task for robustness
         {
@@ -238,14 +250,28 @@ namespace DotNetPlugin
             {
                 var path = ctx.Request.Url.AbsolutePath.ToLowerInvariant();
 
-                if (path.StartsWith("/message"))
+                // Some MCP clients POST to "/sse" instead of "/message". Accept both.
+                if (path.StartsWith("/message") || path.StartsWith("/sse"))
                 {
                     var query = ctx.Request.QueryString["sessionId"];
-                    if (string.IsNullOrWhiteSpace(query) || !_sseSessions.ContainsKey(query))
+                    // fallbacks: headers or single active session
+                    if (string.IsNullOrWhiteSpace(query))
                     {
-                        ctx.Response.StatusCode = 400;
-                        ctx.Response.OutputStream.Close();
-                        return;
+                        query = ctx.Request.Headers["sessionId"] ??
+                                ctx.Request.Headers["Session-Id"] ??
+                                ctx.Request.Headers["X-Session-Id"] ??
+                                ctx.Request.Headers["MCP-Session-Id"];
+                    }
+                    if (string.IsNullOrWhiteSpace(query) && _sseSessions.Count == 1)
+                    {
+                        query = _sseSessions.Keys.First();
+                    }
+                    // fallback: try lookup by client IP
+                    if (string.IsNullOrWhiteSpace(query) && ctx.Request.RemoteEndPoint != null)
+                    {
+                        var ip = ctx.Request.RemoteEndPoint.Address.ToString();
+                        if (_addrToSession.TryGetValue(ip, out var sid))
+                            query = sid;
                     }
 
                     using (var reader = new StreamReader(ctx.Request.InputStream))
@@ -282,6 +308,26 @@ namespace DotNetPlugin
                         string method = json["method"]?.ToString();
                         var @params = json.ContainsKey("params") ? json["params"] as object[] : null;
 
+                        // If no session yet, allow direct reply for HTTP-only clients
+                        bool hasSession = !string.IsNullOrWhiteSpace(query) && _sseSessions.ContainsKey(query);
+                        bool allowDirect = method == "initialize" ||
+                                           method == "rpc.discover" ||
+                                           method == "tools/list" ||
+                                           method == "notifications/initialized" ||
+                                           method == "resources/list" ||
+                                           method == "resources/templates/list" ||
+                                           method == "tools/call";
+                        if (!hasSession && !allowDirect)
+                        {
+                            ctx.Response.StatusCode = 400;
+                            if (pDebug)
+                            {
+                                Console.WriteLine("400 Bad Request - missing sessionId for method: " + method);
+                            }
+                            ctx.Response.OutputStream.Close();
+                            return;
+                        }
+
                         if (method == "rpc.discover")
                         {
                             var toolList = new List<object>();
@@ -303,16 +349,27 @@ namespace DotNetPlugin
 
                             var sseData = new JavaScriptSerializer().Serialize(response);
 
-                            lock (_sseSessions)
+                            if (hasSession)
                             {
-                                var writer = _sseSessions[query];
-                                writer.Write($"id: {json["id"]}\n");
-                                writer.Write($"data: {sseData}\n\n");
-                                writer.Flush();
+                                lock (_sseSessions)
+                                {
+                                    var writer = _sseSessions[query];
+                                    writer.Write($"id: {json["id"]}\n");
+                                    writer.Write($"data: {sseData}\n\n");
+                                    writer.Flush();
+                                }
+                                ctx.Response.StatusCode = 202;
+                                ctx.Response.Close();
                             }
-
-                            ctx.Response.StatusCode = 202;
-                            ctx.Response.Close();
+                            else
+                            {
+                                ctx.Response.StatusCode = 200;
+                                ctx.Response.ContentType = "application/json";
+                                using (var w = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                {
+                                    w.Write(sseData);
+                                }
+                            }
                         }
                         else if (method == "initialize")
                         {
@@ -329,55 +386,55 @@ namespace DotNetPlugin
                             //Transfer - Encoding: chunked
 
                             //Accepted
-                            ctx.Response.SendChunked = true;
-                            ctx.Response.StatusCode = 202;
-                            //ctx.Response.ContentType = "text/plain; charset=utf-8";
-                            using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                            var discoverResponse = new JavaScriptSerializer().Serialize(new
                             {
-
-                                responseWriter.Write($"Accepted");
-                                responseWriter.Flush();
-
-                                try
+                                jsonrpc = "2.0",
+                                id = json["id"],
+                                result = new
                                 {
-                                    var discoverResponse = new JavaScriptSerializer().Serialize(new
+                                    protocolVersion = "2024-11-05",
+                                    capabilities = new { tools = new { } },
+                                    serverInfo = new { name = "AspNetCoreSseServer", version = "1.0.0.0" },
+                                    instructions = ""
+                                }
+                            });
+
+                            if (hasSession)
+                            {
+                                ctx.Response.SendChunked = true;
+                                ctx.Response.StatusCode = 202;
+                                using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                {
+                                    responseWriter.Write($"Accepted");
+                                    responseWriter.Flush();
+
+                                    try
                                     {
-                                        jsonrpc = "2.0",
-                                        id = json["id"],
-                                        result = new
+                                        StreamWriter writer;
+                                        lock (_sseSessions)
                                         {
-                                            protocolVersion = "2024-11-05",
-                                            capabilities = new { tools = new { } },
-                                            serverInfo = new { name = "AspNetCoreSseServer", version = "1.0.0.0" },
-                                            instructions = ""
+                                            writer = _sseSessions[query];
+                                            writer.Write($"data: {discoverResponse}\n\n");
+                                            writer.Flush();
                                         }
-                                    });
 
-                                    StreamWriter writer;
-                                    lock (_sseSessions)
-                                    {
-                                        writer = _sseSessions[query];
-                                        writer.Write($"data: {discoverResponse}\n\n");
-                                        writer.Flush();
+                                        Debug.WriteLine("Responding with Session:" + query);
                                     }
-
-                                    Debug.WriteLine("Responding with Session:" + query);
+                                    catch (Exception ex)
+                                    {
+                                        Console.WriteLine($"SSE connection error: {ex.Message}");
+                                    }
                                 }
-                                catch (Exception ex)
+                            }
+                            else
+                            {
+                                // No SSE session yet; reply directly
+                                ctx.Response.StatusCode = 200;
+                                ctx.Response.ContentType = "application/json";
+                                using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
                                 {
-                                    Console.WriteLine($"SSE connection error: {ex.Message}");
+                                    responseWriter.Write(discoverResponse);
                                 }
-                                finally
-                                {
-                                    //lock (_sseSessions)
-                                    //    _sseSessions.Remove(sessionId);
-                                    //ctx.Response.Close();
-                                }
-                                //responseWriter.Write("Accepted");
-                                //responseWriter.Flush();
-                                //responseWriter.Close();
-                                // Don't close the writer or ctx.Response — keep it open for future use
-                                //await Task.Delay(-1); // keep this handler alive forever (or until cancelled)
                             }
                         }
                         else if (method == "notifications/initialized")
@@ -406,36 +463,21 @@ namespace DotNetPlugin
                         }
                         else if (method == "tools/list")
                         {
-                            //POST /message?sessionId=nn-PaJBhGnUTSs8Wi9IYeA HTTP/1.1
-                            //Host: localhost: 50300
-                            //Content-Type: application/json; charset=utf-8
-                            //Content-Length: 202
-                            //{"jsonrpc":"2.0","id":"d95cc745587346b4bf7df2b13ec0890a-2","method":"tools/list"}
-                            //Accepted
-                            ctx.Response.SendChunked = true;
-                            ctx.Response.StatusCode = 202;
-                            //ctx.Response.ContentType = "text/plain; charset=utf-8";
-                            using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
-                            {
-                                responseWriter.Write("Accepted");
-                                responseWriter.BaseStream.Flush();
-                            }
+                            //POST /message?sessionId=... HTTP/1.1
+                            //{"jsonrpc":"2.0","id":1,"method":"tools/list"}
                             try
                             {
                                 // Dynamically get all Command methods
                                 var toolsList = new List<object>();
 
-                                // Use _commands dictionary which should contain all registered commands
                                 foreach (var command in _commands)
                                 {
                                     string commandName = command.Key;
                                     MethodInfo methodInfo = command.Value;
 
-                                    // Get the Command attribute to access its properties
                                     var attribute = methodInfo.GetCustomAttribute<CommandAttribute>();
-                                    if (attribute != null && (!attribute.DebugOnly || Debugger.IsAttached || (Bridge.DbgIsDebugging() && Bridge.DbgValFromString("$pid") > 0 )))
+                                    if (attribute != null && (!attribute.DebugOnly || Debugger.IsAttached || (Bridge.DbgIsDebugging() && Bridge.DbgValFromString("$pid") > 0)))
                                     {
-                                        // Get parameter info for the method
                                         var parameters = methodInfo.GetParameters();
                                         var properties = new Dictionary<string, object>();
                                         var required = new List<string>();
@@ -445,17 +487,17 @@ namespace DotNetPlugin
                                             string paramName = param.Name;
                                             string paramType = GetJsonSchemaType(param.ParameterType);
                                             string paramdescription = $"Parameter for {commandName}";
-                                            switch (paramName) // Removed 'case' from here
+                                            switch (paramName)
                                             {
                                                 case "address":
                                                     paramdescription = "Address to target with function (Example format: 0x12345678)";
-                                                    break; // Added break
+                                                    break;
                                                 case "value":
                                                     paramdescription = "value to pass to command (Example format: 100)";
-                                                    break; // Added break
+                                                    break;
                                                 case "byteCount":
                                                     paramdescription = "Count of how many bytes to request for (Example format: 100)";
-                                                    break; // Added break
+                                                    break;
                                                 case "pfilepath":
                                                     paramdescription = "File path (Example format: C:\\output.txt)";
                                                     break;
@@ -466,19 +508,14 @@ namespace DotNetPlugin
                                                     paramdescription = "Writes the provided Hex bytes .. .. (Example format: byteString=00 90 0F)";
                                                     break;
                                                 default:
-                                                    // No action needed here since the default description is already set above.
-                                                    // The break is technically optional for the last section (default),
-                                                    // but good practice to include.
                                                     break;
                                             }
-
 
                                             properties[paramName] = new
                                             {
                                                 type = paramType,
                                                 description = paramdescription
                                             };
-                                                
 
                                             if (!param.IsOptional)
                                             {
@@ -486,7 +523,6 @@ namespace DotNetPlugin
                                             }
                                         }
 
-                                        // Create the tool definition
                                         object tool;
                                         if (attribute.MCPCmdDescription != null)
                                         {
@@ -505,7 +541,7 @@ namespace DotNetPlugin
                                             };
                                         }
                                         else
-                                        {                                        
+                                        {
                                             tool = new
                                             {
                                                 name = commandName,
@@ -524,7 +560,7 @@ namespace DotNetPlugin
                                     }
                                 }
 
-                                // Add the default tools for Diag
+                                // Add the default tools for diag
                                 toolsList.Add(
                                     new
                                     {
@@ -537,17 +573,13 @@ namespace DotNetPlugin
                                             type = "object",
                                             properties = new
                                             {
-                                                message = new
-                                                {
-                                                    type = "string"
-                                                }
+                                                message = new { type = "string" }
                                             },
                                             required = new[] { "message" }
                                         }
-                                    }
-                                );
+                                    });
 
-                                var discoverResponse = new JavaScriptSerializer().Serialize(new
+                                var toolsResponse = new JavaScriptSerializer().Serialize(new
                                 {
                                     jsonrpc = "2.0",
                                     id = json["id"],
@@ -557,24 +589,122 @@ namespace DotNetPlugin
                                     }
                                 });
 
-                                StreamWriter writer;
-                                lock (_sseSessions)
+                                if (hasSession)
                                 {
-                                    writer = _sseSessions[query];
-                                    writer.Write($"data: {discoverResponse}\n\n");
-                                    writer.Flush();
+                                    // SSE-style reply: 202 + "Accepted" and push over event-stream
+                                    ctx.Response.SendChunked = true;
+                                    ctx.Response.StatusCode = 202;
+                                    using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                    {
+                                        responseWriter.Write("Accepted");
+                                        responseWriter.BaseStream.Flush();
+                                    }
+
+                                    StreamWriter writer;
+                                    lock (_sseSessions)
+                                    {
+                                        writer = _sseSessions[query];
+                                        writer.Write($"data: {toolsResponse}\n\n");
+                                        writer.Flush();
+                                    }
+                                    Debug.WriteLine("Responding with Session:" + query);
                                 }
-                                Debug.WriteLine("Responding with Session:" + query);
+                                else
+                                {
+                                    // HTTP-only reply (no SSE session yet)
+                                    ctx.Response.StatusCode = 200;
+                                    ctx.Response.ContentType = "application/json";
+                                    using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                    {
+                                        responseWriter.Write(toolsResponse);
+                                    }
+                                }
                             }
                             catch (Exception ex)
                             {
                                 Console.WriteLine($"SSE connection error: {ex.Message}");
                             }
-                            finally
+                        }
+                        else if (method == "resources/list")
+                        {
+                            // Minimal MCP resources support: no resources
+                            var resourcesResponse = new JavaScriptSerializer().Serialize(new
                             {
-                                //lock (_sseSessions)
-                                //    _sseSessions.Remove(sessionId);
-                                //ctx.Response.Close();
+                                jsonrpc = "2.0",
+                                id = json["id"],
+                                result = new
+                                {
+                                    resources = new object[] { }
+                                }
+                            });
+
+                            if (hasSession)
+                            {
+                                ctx.Response.SendChunked = true;
+                                ctx.Response.StatusCode = 202;
+                                using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                {
+                                    responseWriter.Write("Accepted");
+                                    responseWriter.BaseStream.Flush();
+                                }
+
+                                StreamWriter writer;
+                                lock (_sseSessions)
+                                {
+                                    writer = _sseSessions[query];
+                                    writer.Write($"data: {resourcesResponse}\n\n");
+                                    writer.Flush();
+                                }
+                            }
+                            else
+                            {
+                                ctx.Response.StatusCode = 200;
+                                ctx.Response.ContentType = "application/json";
+                                using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                {
+                                    responseWriter.Write(resourcesResponse);
+                                }
+                            }
+                        }
+                        else if (method == "resources/templates/list")
+                        {
+                            // Minimal MCP resource templates support: none defined
+                            var templatesResponse = new JavaScriptSerializer().Serialize(new
+                            {
+                                jsonrpc = "2.0",
+                                id = json["id"],
+                                result = new
+                                {
+                                    resourceTemplates = new object[] { }
+                                }
+                            });
+
+                            if (hasSession)
+                            {
+                                ctx.Response.SendChunked = true;
+                                ctx.Response.StatusCode = 202;
+                                using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                {
+                                    responseWriter.Write("Accepted");
+                                    responseWriter.BaseStream.Flush();
+                                }
+
+                                StreamWriter writer;
+                                lock (_sseSessions)
+                                {
+                                    writer = _sseSessions[query];
+                                    writer.Write($"data: {templatesResponse}\n\n");
+                                    writer.Flush();
+                                }
+                            }
+                            else
+                            {
+                                ctx.Response.StatusCode = 200;
+                                ctx.Response.ContentType = "application/json";
+                                using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                {
+                                    responseWriter.Write(templatesResponse);
+                                }
                             }
                         }
                         else if (method == "tools/call")
@@ -585,13 +715,22 @@ namespace DotNetPlugin
                             //Content-Length: 202
                             //{ "jsonrpc":"2.0","id":"d95cc745587346b4bf7df2b13ec0890a-3","method":"tools/call","params":{ "name":"Echo","arguments":{ "message":"tesrt"} } }
                             //Accepted
-                            ctx.Response.SendChunked = true;
-                            ctx.Response.StatusCode = 202;
-                            //ctx.Response.ContentType = "text/plain; charset=utf-8";
-                            using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                            var hasSessionCall = !string.IsNullOrWhiteSpace(query) && _sseSessions.ContainsKey(query);
+
+                            if (hasSessionCall)
                             {
-                                responseWriter.Write("Accepted");
-                                responseWriter.BaseStream.Flush();
+                                ctx.Response.SendChunked = true;
+                                ctx.Response.StatusCode = 202;
+                                using (var responseWriter = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                {
+                                    responseWriter.Write("Accepted");
+                                    responseWriter.BaseStream.Flush();
+                                }
+                            }
+                            else
+                            {
+                                ctx.Response.StatusCode = 200;
+                                ctx.Response.ContentType = "application/json";
                             }
                             try
                             {
@@ -754,14 +893,24 @@ namespace DotNetPlugin
                                     }
                                 });
 
-                                StreamWriter writer;
-                                lock (_sseSessions)
+                                if (hasSessionCall)
                                 {
-                                    writer = _sseSessions[query];
-                                    writer.Write($"data: {responseJson}\n\n");
-                                    writer.Flush();
+                                    StreamWriter writer;
+                                    lock (_sseSessions)
+                                    {
+                                        writer = _sseSessions[query];
+                                        writer.Write($"data: {responseJson}\n\n");
+                                        writer.Flush();
+                                    }
+                                    Debug.WriteLine("Responding with Session:" + query);
                                 }
-                                Debug.WriteLine("Responding with Session:" + query);
+                                else
+                                {
+                                    using (var w = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                    {
+                                        w.Write(responseJson);
+                                    }
+                                }
                             }
                             catch (Exception ex)
                             {
@@ -782,12 +931,24 @@ namespace DotNetPlugin
                                     }
                                 });
 
-                                StreamWriter writer;
-                                lock (_sseSessions)
+                                if (hasSessionCall)
                                 {
-                                    writer = _sseSessions[query];
-                                    writer.Write($"data: {errorJson}\n\n");
-                                    writer.Flush();
+                                    StreamWriter writer;
+                                    lock (_sseSessions)
+                                    {
+                                        writer = _sseSessions[query];
+                                        writer.Write($"data: {errorJson}\n\n");
+                                        writer.Flush();
+                                    }
+                                }
+                                else
+                                {
+                                    ctx.Response.StatusCode = 500;
+                                    ctx.Response.ContentType = "application/json";
+                                    using (var w = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
+                                    {
+                                        w.Write(errorJson);
+                                    }
                                 }
 
                                 Console.WriteLine($"Error processing tools/call: {ex.Message}");
@@ -938,7 +1099,14 @@ namespace DotNetPlugin
 
                     var writer = new StreamWriter(ctx.Response.OutputStream);
                     lock (_sseSessions)
+                    {
                         _sseSessions[sessionId] = writer;
+                        if (ctx.Request.RemoteEndPoint != null)
+                        {
+                            var ip = ctx.Request.RemoteEndPoint.Address.ToString();
+                            _addrToSession[ip] = sessionId;
+                        }
+                    }
 
                     // Write required handshake format
                     writer.Write($"event: endpoint\n");
